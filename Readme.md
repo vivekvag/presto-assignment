@@ -143,7 +143,7 @@ docker run --rm -p 8090:8080 \
 
 Open `http://localhost:8090`.
 
-## Notes for Interviewers
+## Notes
 
 - Charger-level pricing (not region-level) is supported.
 - Timezone handling is implemented via:
