@@ -1,13 +1,11 @@
-package main
+package api
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,34 +13,17 @@ import (
 	_ "time/tzdata"
 
 	"github.com/go-chi/chi/v5"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"presto/internal/models"
 )
 
-type Charger struct {
-	ID        string    `gorm:"primaryKey;size:64" json:"id"`
-	Name      string    `gorm:"size:255;not null" json:"name"`
-	Timezone  string    `gorm:"size:64;not null;default:UTC" json:"timezone"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+type Handler struct {
+	db *gorm.DB
 }
 
-type PricingSchedule struct {
-	ID            uint            `gorm:"primaryKey"`
-	ChargerID     string          `gorm:"size:64;not null;index"`
-	EffectiveFrom time.Time       `gorm:"type:date;not null;index"`
-	EffectiveTo   *time.Time      `gorm:"type:date;index"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
-	Periods       []PricingPeriod `gorm:"foreignKey:ScheduleID;references:ID;constraint:OnDelete:CASCADE"`
-}
-
-type PricingPeriod struct {
-	ID          uint    `gorm:"primaryKey"`
-	ScheduleID  uint    `gorm:"not null;index"`
-	StartMinute int     `gorm:"not null"`
-	EndMinute   int     `gorm:"not null"`
-	PricePerKWh float64 `gorm:"type:numeric(10,4);not null"`
+func NewHandler(db *gorm.DB) *Handler {
+	return &Handler{db: db}
 }
 
 type createChargerRequest struct {
@@ -84,47 +65,7 @@ type periodResponse struct {
 	PricePerKWh float64 `json:"price_per_kwh"`
 }
 
-type app struct {
-	db *gorm.DB
-}
-
-func main() {
-	dsn := getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/presto?sslmode=disable")
-	port := getenv("PORT", "8080")
-
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatalf("failed to connect database: %v", err)
-	}
-
-	if err := db.AutoMigrate(&Charger{}, &PricingSchedule{}, &PricingPeriod{}); err != nil {
-		log.Fatalf("failed to migrate schema: %v", err)
-	}
-
-	a := &app{db: db}
-
-	r := chi.NewRouter()
-	r.Post("/api/v1/chargers", a.handleCreateCharger)
-	r.Put("/api/v1/chargers/{chargerID}/pricing", a.handleUpdatePricing)
-	r.Get("/api/v1/chargers/{chargerID}/pricing", a.handleGetPricing)
-	r.Put("/api/v1/pricing/bulk", a.handleBulkUpdatePricing)
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	srv := &http.Server{
-		Addr:              ":" + port,
-		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	log.Printf("server listening on :%s", port)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
-	}
-}
-
-func (a *app) handleCreateCharger(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleCreateCharger(w http.ResponseWriter, r *http.Request) {
 	req, ok := decodeJSON[createChargerRequest](w, r)
 	if !ok {
 		return
@@ -144,13 +85,13 @@ func (a *app) handleCreateCharger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	charger := Charger{
+	charger := models.Charger{
 		ID:       strings.TrimSpace(req.ID),
 		Name:     strings.TrimSpace(req.Name),
 		Timezone: tz,
 	}
 
-	if err := a.db.WithContext(r.Context()).Create(&charger).Error; err != nil {
+	if err := h.db.WithContext(r.Context()).Create(&charger).Error; err != nil {
 		writeError(w, http.StatusConflict, "charger already exists")
 		return
 	}
@@ -158,7 +99,7 @@ func (a *app) handleCreateCharger(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, charger)
 }
 
-func (a *app) handleUpdatePricing(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleUpdatePricing(w http.ResponseWriter, r *http.Request) {
 	chargerID := strings.TrimSpace(chi.URLParam(r, "chargerID"))
 	if chargerID == "" {
 		writeError(w, http.StatusBadRequest, "chargerID is required")
@@ -202,14 +143,14 @@ func (a *app) handleUpdatePricing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	var charger Charger
-	if err := a.db.WithContext(ctx).First(&charger, "id = ?", chargerID).Error; err != nil {
+	var charger models.Charger
+	if err := h.db.WithContext(ctx).First(&charger, "id = ?", chargerID).Error; err != nil {
 		writeError(w, http.StatusNotFound, "charger not found")
 		return
 	}
 
-	if err := a.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		s := PricingSchedule{
+	if err := h.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		s := models.PricingSchedule{
 			ChargerID:     charger.ID,
 			EffectiveFrom: effectiveFrom,
 			EffectiveTo:   effectiveTo,
@@ -218,9 +159,9 @@ func (a *app) handleUpdatePricing(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
-		periodRows := make([]PricingPeriod, 0, len(periods))
+		periodRows := make([]models.PricingPeriod, 0, len(periods))
 		for _, p := range periods {
-			periodRows = append(periodRows, PricingPeriod{
+			periodRows = append(periodRows, models.PricingPeriod{
 				ScheduleID:  s.ID,
 				StartMinute: p.StartMinute,
 				EndMinute:   p.EndMinute,
@@ -238,15 +179,15 @@ func (a *app) handleUpdatePricing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *app) handleGetPricing(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleGetPricing(w http.ResponseWriter, r *http.Request) {
 	chargerID := strings.TrimSpace(chi.URLParam(r, "chargerID"))
 	if chargerID == "" {
 		writeError(w, http.StatusBadRequest, "chargerID is required")
 		return
 	}
 
-	var charger Charger
-	if err := a.db.WithContext(r.Context()).First(&charger, "id = ?", chargerID).Error; err != nil {
+	var charger models.Charger
+	if err := h.db.WithContext(r.Context()).First(&charger, "id = ?", chargerID).Error; err != nil {
 		writeError(w, http.StatusNotFound, "charger not found")
 		return
 	}
@@ -257,7 +198,7 @@ func (a *app) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	schedule, err := findScheduleForDate(r.Context(), a.db, chargerID, dateVal)
+	schedule, err := findScheduleForDate(r.Context(), h.db, chargerID, dateVal)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "no pricing schedule found for date")
@@ -293,7 +234,7 @@ func (a *app) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) HandleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
 	req, ok := decodeJSON[bulkUpdatePricingRequest](w, r)
 	if !ok {
 		return
@@ -346,8 +287,8 @@ func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
 		cleanIDs = append(cleanIDs, v)
 	}
 
-	var chargers []Charger
-	if err := a.db.WithContext(r.Context()).Where("id IN ?", cleanIDs).Find(&chargers).Error; err != nil {
+	var chargers []models.Charger
+	if err := h.db.WithContext(r.Context()).Where("id IN ?", cleanIDs).Find(&chargers).Error; err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load chargers")
 		return
 	}
@@ -356,9 +297,9 @@ func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := a.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+	if err := h.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
 		for _, charger := range chargers {
-			s := PricingSchedule{
+			s := models.PricingSchedule{
 				ChargerID:     charger.ID,
 				EffectiveFrom: effectiveFrom,
 				EffectiveTo:   effectiveTo,
@@ -367,9 +308,9 @@ func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 
-			periodRows := make([]PricingPeriod, 0, len(periods))
+			periodRows := make([]models.PricingPeriod, 0, len(periods))
 			for _, p := range periods {
-				periodRows = append(periodRows, PricingPeriod{
+				periodRows = append(periodRows, models.PricingPeriod{
 					ScheduleID:  s.ID,
 					StartMinute: p.StartMinute,
 					EndMinute:   p.EndMinute,
@@ -392,8 +333,8 @@ func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func findScheduleForDate(ctx context.Context, db *gorm.DB, chargerID string, dateVal time.Time) (PricingSchedule, error) {
-	var schedule PricingSchedule
+func findScheduleForDate(ctx context.Context, db *gorm.DB, chargerID string, dateVal time.Time) (models.PricingSchedule, error) {
+	var schedule models.PricingSchedule
 	err := db.WithContext(ctx).
 		Preload("Periods", func(tx *gorm.DB) *gorm.DB {
 			return tx.Order("start_minute ASC")
@@ -404,8 +345,8 @@ func findScheduleForDate(ctx context.Context, db *gorm.DB, chargerID string, dat
 	return schedule, err
 }
 
-func validateAndMapPeriods(in []periodRequest) ([]PricingPeriod, error) {
-	out := make([]PricingPeriod, 0, len(in))
+func validateAndMapPeriods(in []periodRequest) ([]models.PricingPeriod, error) {
+	out := make([]models.PricingPeriod, 0, len(in))
 	for _, p := range in {
 		start, err := parseHHMM(p.StartTime)
 		if err != nil {
@@ -421,7 +362,7 @@ func validateAndMapPeriods(in []periodRequest) ([]PricingPeriod, error) {
 		if p.PricePerKWh < 0 {
 			return nil, errors.New("price_per_kwh must be >= 0")
 		}
-		out = append(out, PricingPeriod{
+		out = append(out, models.PricingPeriod{
 			StartMinute: start,
 			EndMinute:   end,
 			PricePerKWh: p.PricePerKWh,
@@ -528,12 +469,4 @@ func decodeJSON[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
 		return v, false
 	}
 	return v, true
-}
-
-func getenv(key, fallback string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return fallback
-	}
-	return v
 }

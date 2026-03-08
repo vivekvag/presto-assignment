@@ -1,14 +1,55 @@
-# Local Setup and Swagger
+# EV Charger TOU Pricing API
 
-## 1) Run on localhost
+Backend service for managing charger-specific Time-of-Use (TOU) pricing schedules.
+
+## Tech Stack
+
+- Go 1.22
+- Chi (HTTP router)
+- GORM (ORM)
+- PostgreSQL 16
+- Docker + Docker Compose
+- OpenAPI 3 (`swagger.yaml`)
+
+## Project Structure
+
+```text
+cmd/
+  api/
+    main.go              # service bootstrap and HTTP server
+internal/
+  api/
+    handler.go           # HTTP handlers + validation + response mapping
+    router.go            # route registration
+  config/
+    config.go            # environment configuration
+  database/
+    database.go          # DB connection + migrations
+  models/
+    models.go            # GORM entities
+docker-compose.yml
+Dockerfile
+swagger.yaml
+Readme.md
+```
+
+## Domain Model
+
+- `chargers`: charger metadata (`id`, `name`, `timezone`)
+- `pricing_schedules`: effective date window per charger
+- `pricing_periods`: daily price windows (`start_time`, `end_time`, `price_per_kwh`) linked to a schedule
+
+This keeps the schema normalized and query-friendly.
+
+## Run Locally
 
 ```bash
 docker compose up --build
 ```
 
-This starts:
-- Postgres on `localhost:5432`
-- API on `localhost:8080`
+Services:
+- API: `http://localhost:8080`
+- Postgres: `localhost:5432`
 
 Health check:
 
@@ -16,29 +57,16 @@ Health check:
 curl http://localhost:8080/healthz
 ```
 
-Expected response:
+## API Endpoints
 
-```json
-{"status":"ok"}
-```
+- `POST /api/v1/chargers` - Create charger
+- `PUT /api/v1/chargers/{chargerID}/pricing` - Add pricing schedule for a charger
+- `GET /api/v1/chargers/{chargerID}/pricing` - Retrieve pricing using either `date+time` or `timestamp`
+- `PUT /api/v1/pricing/bulk` - Apply pricing schedule to multiple chargers
 
-## 2) Open Swagger UI
+## Sample Requests
 
-Use Swagger UI container and mount local spec file:
-
-```bash
-docker run --rm -p 8090:8080 \
-  -e SWAGGER_JSON=/spec/swagger.yaml \
-  -v "$(pwd)/swagger.yaml:/spec/swagger.yaml:ro" \
-  swaggerapi/swagger-ui
-```
-
-Open:
-- `http://localhost:8090`
-
-## 3) Quick API flow
-
-### Create charger
+Create charger:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/chargers \
@@ -50,7 +78,7 @@ curl -X POST http://localhost:8080/api/v1/chargers \
   }'
 ```
 
-### Add/update pricing schedule
+Update pricing for one charger:
 
 ```bash
 curl -X PUT http://localhost:8080/api/v1/chargers/charger-001/pricing \
@@ -70,21 +98,19 @@ curl -X PUT http://localhost:8080/api/v1/chargers/charger-001/pricing \
   }'
 ```
 
-### Get pricing for date/time
+Get pricing by date/time:
 
 ```bash
 curl "http://localhost:8080/api/v1/chargers/charger-001/pricing?date=2026-03-08&time=14:30"
 ```
 
-### Get pricing using timestamp (timezone-aware)
-
-The API converts timestamp into charger local timezone before matching the pricing period.
+Get pricing by timestamp (timezone-aware):
 
 ```bash
 curl "http://localhost:8080/api/v1/chargers/charger-001/pricing?timestamp=2026-03-08T09:00:00Z"
 ```
 
-### Bulk update pricing for multiple chargers
+Bulk update:
 
 ```bash
 curl -X PUT http://localhost:8080/api/v1/pricing/bulk \
@@ -102,8 +128,25 @@ curl -X PUT http://localhost:8080/api/v1/pricing/bulk \
   }'
 ```
 
-## 4) Stop containers
+## Swagger
+
+Swagger spec lives in `swagger.yaml`.
+
+Run Swagger UI:
 
 ```bash
-docker compose down
+docker run --rm -p 8090:8080 \
+  -e SWAGGER_JSON=/spec/swagger.yaml \
+  -v "$(pwd)/swagger.yaml:/spec/swagger.yaml:ro" \
+  swaggerapi/swagger-ui
 ```
+
+Open `http://localhost:8090`.
+
+## Notes for Interviewers
+
+- Charger-level pricing (not region-level) is supported.
+- Timezone handling is implemented via:
+  - charger timezone persistence
+  - timestamp-to-local conversion for pricing lookup
+- Bulk updates are supported through a dedicated endpoint.
