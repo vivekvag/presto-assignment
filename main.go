@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/go-chi/chi/v5"
 	"gorm.io/driver/postgres"
@@ -33,7 +34,7 @@ type PricingSchedule struct {
 	EffectiveTo   *time.Time      `gorm:"type:date;index"`
 	CreatedAt     time.Time       `json:"created_at"`
 	UpdatedAt     time.Time       `json:"updated_at"`
-	Periods       []PricingPeriod `gorm:"constraint:OnDelete:CASCADE"`
+	Periods       []PricingPeriod `gorm:"foreignKey:ScheduleID;references:ID;constraint:OnDelete:CASCADE"`
 }
 
 type PricingPeriod struct {
@@ -51,6 +52,13 @@ type createChargerRequest struct {
 }
 
 type updatePricingRequest struct {
+	EffectiveFrom string          `json:"effective_from"`
+	EffectiveTo   *string         `json:"effective_to"`
+	Periods       []periodRequest `json:"periods"`
+}
+
+type bulkUpdatePricingRequest struct {
+	ChargerIDs    []string        `json:"charger_ids"`
 	EffectiveFrom string          `json:"effective_from"`
 	EffectiveTo   *string         `json:"effective_to"`
 	Periods       []periodRequest `json:"periods"`
@@ -99,6 +107,7 @@ func main() {
 	r.Post("/api/v1/chargers", a.handleCreateCharger)
 	r.Put("/api/v1/chargers/{chargerID}/pricing", a.handleUpdatePricing)
 	r.Get("/api/v1/chargers/{chargerID}/pricing", a.handleGetPricing)
+	r.Put("/api/v1/pricing/bulk", a.handleBulkUpdatePricing)
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -236,27 +245,15 @@ func (a *app) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queryDate := strings.TrimSpace(r.URL.Query().Get("date"))
-	queryTime := strings.TrimSpace(r.URL.Query().Get("time"))
-	if queryDate == "" || queryTime == "" {
-		writeError(w, http.StatusBadRequest, "date and time query params are required")
-		return
-	}
-
-	dateVal, err := parseDate(queryDate)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "date must be YYYY-MM-DD")
-		return
-	}
-	minuteOfDay, err := parseHHMM(queryTime)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "time must be HH:MM in 24-hour format")
-		return
-	}
-
 	var charger Charger
 	if err := a.db.WithContext(r.Context()).First(&charger, "id = ?", chargerID).Error; err != nil {
 		writeError(w, http.StatusNotFound, "charger not found")
+		return
+	}
+
+	dateVal, minuteOfDay, err := resolveLocalDateAndMinute(r, charger.Timezone)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -294,6 +291,105 @@ func (a *app) handleGetPricing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *app) handleBulkUpdatePricing(w http.ResponseWriter, r *http.Request) {
+	req, ok := decodeJSON[bulkUpdatePricingRequest](w, r)
+	if !ok {
+		return
+	}
+	if len(req.ChargerIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "charger_ids are required")
+		return
+	}
+	if len(req.Periods) == 0 {
+		writeError(w, http.StatusBadRequest, "periods are required")
+		return
+	}
+
+	effectiveFrom, err := parseDate(req.EffectiveFrom)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "effective_from must be YYYY-MM-DD")
+		return
+	}
+	var effectiveTo *time.Time
+	if req.EffectiveTo != nil && strings.TrimSpace(*req.EffectiveTo) != "" {
+		et, err := parseDate(*req.EffectiveTo)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "effective_to must be YYYY-MM-DD")
+			return
+		}
+		if et.Before(effectiveFrom) {
+			writeError(w, http.StatusBadRequest, "effective_to cannot be before effective_from")
+			return
+		}
+		effectiveTo = &et
+	}
+	periods, err := validateAndMapPeriods(req.Periods)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	cleanIDs := make([]string, 0, len(req.ChargerIDs))
+	seen := make(map[string]struct{}, len(req.ChargerIDs))
+	for _, id := range req.ChargerIDs {
+		v := strings.TrimSpace(id)
+		if v == "" {
+			writeError(w, http.StatusBadRequest, "charger_ids cannot contain empty values")
+			return
+		}
+		if _, exists := seen[v]; exists {
+			continue
+		}
+		seen[v] = struct{}{}
+		cleanIDs = append(cleanIDs, v)
+	}
+
+	var chargers []Charger
+	if err := a.db.WithContext(r.Context()).Where("id IN ?", cleanIDs).Find(&chargers).Error; err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load chargers")
+		return
+	}
+	if len(chargers) != len(cleanIDs) {
+		writeError(w, http.StatusNotFound, "one or more chargers not found")
+		return
+	}
+
+	if err := a.db.WithContext(r.Context()).Transaction(func(tx *gorm.DB) error {
+		for _, charger := range chargers {
+			s := PricingSchedule{
+				ChargerID:     charger.ID,
+				EffectiveFrom: effectiveFrom,
+				EffectiveTo:   effectiveTo,
+			}
+			if err := tx.Create(&s).Error; err != nil {
+				return err
+			}
+
+			periodRows := make([]PricingPeriod, 0, len(periods))
+			for _, p := range periods {
+				periodRows = append(periodRows, PricingPeriod{
+					ScheduleID:  s.ID,
+					StartMinute: p.StartMinute,
+					EndMinute:   p.EndMinute,
+					PricePerKWh: p.PricePerKWh,
+				})
+			}
+			if err := tx.Create(&periodRows).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to bulk update pricing")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message":          "bulk pricing schedules updated",
+		"updated_chargers": len(cleanIDs),
+	})
 }
 
 func findScheduleForDate(ctx context.Context, db *gorm.DB, chargerID string, dateVal time.Time) (PricingSchedule, error) {
@@ -347,6 +443,45 @@ func validateAndMapPeriods(in []periodRequest) ([]PricingPeriod, error) {
 
 func parseDate(v string) (time.Time, error) {
 	return time.Parse("2006-01-02", strings.TrimSpace(v))
+}
+
+func resolveLocalDateAndMinute(r *http.Request, timezone string) (time.Time, int, error) {
+	queryDate := strings.TrimSpace(r.URL.Query().Get("date"))
+	queryTime := strings.TrimSpace(r.URL.Query().Get("time"))
+	queryTimestamp := strings.TrimSpace(r.URL.Query().Get("timestamp"))
+
+	if queryTimestamp != "" {
+		if queryDate != "" || queryTime != "" {
+			return time.Time{}, 0, errors.New("use either timestamp or date+time, not both")
+		}
+		t, err := time.Parse(time.RFC3339, queryTimestamp)
+		if err != nil {
+			return time.Time{}, 0, errors.New("timestamp must be RFC3339, e.g. 2026-03-08T14:30:00Z")
+		}
+		loc, err := time.LoadLocation(timezone)
+		if err != nil {
+			return time.Time{}, 0, errors.New("charger timezone cannot be loaded")
+		}
+		local := t.In(loc)
+		dateOnly, err := parseDate(local.Format("2006-01-02"))
+		if err != nil {
+			return time.Time{}, 0, errors.New("failed to derive local date from timestamp")
+		}
+		return dateOnly, local.Hour()*60 + local.Minute(), nil
+	}
+
+	if queryDate == "" || queryTime == "" {
+		return time.Time{}, 0, errors.New("provide either timestamp or both date and time query params")
+	}
+	dateVal, err := parseDate(queryDate)
+	if err != nil {
+		return time.Time{}, 0, errors.New("date must be YYYY-MM-DD")
+	}
+	minuteOfDay, err := parseHHMM(queryTime)
+	if err != nil {
+		return time.Time{}, 0, errors.New("time must be HH:MM in 24-hour format")
+	}
+	return dateVal, minuteOfDay, nil
 }
 
 func parseHHMM(v string) (int, error) {

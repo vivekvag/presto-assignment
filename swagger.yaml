@@ -1,0 +1,329 @@
+openapi: 3.0.3
+info:
+  title: EV Charger TOU Pricing API
+  version: 1.0.0
+  description: API for charger-specific time-of-use pricing schedules.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/v1/chargers:
+    post:
+      summary: Create charger
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChargerRequest'
+      responses:
+        '201':
+          description: Charger created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charger'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Charger already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/chargers/{chargerID}/pricing:
+    put:
+      summary: Add a pricing schedule for a charger
+      parameters:
+        - name: chargerID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePricingRequest'
+      responses:
+        '200':
+          description: Pricing schedule updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: pricing schedule updated
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Charger not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      summary: Get pricing by charger, date and time
+      parameters:
+        - name: chargerID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+            example: '2026-03-08'
+        - name: time
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+            example: '14:30'
+        - name: timestamp
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: '2026-03-08T09:00:00Z'
+      responses:
+        '200':
+          description: Pricing response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Charger or schedule not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/pricing/bulk:
+    put:
+      summary: Bulk add pricing schedule to multiple chargers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkUpdatePricingRequest'
+      responses:
+        '200':
+          description: Bulk pricing schedules updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: bulk pricing schedules updated
+                  updated_chargers:
+                    type: integer
+                    example: 2
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: One or more chargers not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    Charger:
+      type: object
+      properties:
+        id:
+          type: string
+          example: charger-001
+        name:
+          type: string
+          example: Downtown Charger
+        timezone:
+          type: string
+          example: Asia/Kolkata
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, name, timezone]
+
+    CreateChargerRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          example: charger-001
+        name:
+          type: string
+          example: Downtown Charger
+        timezone:
+          type: string
+          example: Asia/Kolkata
+      required: [id, name]
+
+    PeriodRequest:
+      type: object
+      properties:
+        start_time:
+          type: string
+          example: '06:00'
+        end_time:
+          type: string
+          example: '12:00'
+        price_per_kwh:
+          type: number
+          format: double
+          example: 0.2
+      required: [start_time, end_time, price_per_kwh]
+
+    UpdatePricingRequest:
+      type: object
+      properties:
+        effective_from:
+          type: string
+          format: date
+          example: '2026-03-08'
+        effective_to:
+          type: string
+          format: date
+          nullable: true
+          example: null
+        periods:
+          type: array
+          items:
+            $ref: '#/components/schemas/PeriodRequest'
+      required: [effective_from, periods]
+
+    BulkUpdatePricingRequest:
+      type: object
+      properties:
+        charger_ids:
+          type: array
+          items:
+            type: string
+          example: [charger-001, charger-002]
+        effective_from:
+          type: string
+          format: date
+          example: '2026-03-08'
+        effective_to:
+          type: string
+          format: date
+          nullable: true
+          example: null
+        periods:
+          type: array
+          items:
+            $ref: '#/components/schemas/PeriodRequest'
+      required: [charger_ids, effective_from, periods]
+
+    PeriodResponse:
+      type: object
+      properties:
+        start_time:
+          type: string
+          example: '14:00'
+        end_time:
+          type: string
+          example: '18:00'
+        price_per_kwh:
+          type: number
+          format: double
+          example: 0.3
+      required: [start_time, end_time, price_per_kwh]
+
+    PricingResponse:
+      type: object
+      properties:
+        charger_id:
+          type: string
+          example: charger-001
+        effective_from:
+          type: string
+          format: date
+          example: '2026-03-08'
+        effective_to:
+          type: string
+          format: date
+          nullable: true
+        periods:
+          type: array
+          items:
+            $ref: '#/components/schemas/PeriodResponse'
+        current_period:
+          $ref: '#/components/schemas/PeriodResponse'
+      required: [charger_id, effective_from, periods]
